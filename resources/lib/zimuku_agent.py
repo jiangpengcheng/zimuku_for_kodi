@@ -31,36 +31,22 @@ class Zimuku_Agent:
     def __init__(self, base_url, dl_location, logger, unpacker, settings):
         self.ua = 'Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; Trident/6.0)'
         self.ZIMUKU_BASE = base_url
-        self.INIT_PAGE = base_url + '/?security_verify_data=313932302c31303830'
-        # self.ZIMUKU_API = '%s/search?q=%%s&vertoken=%%s' % base_url
-        self.TOKEN_PARAM = 'security_verify_data=313932302c31303830'
-        self.ZIMUKU_API = '%s/search?q=%%s' % base_url
+        self.ZIMUKU_API = '%s/search?q=%%s&security_verify_data=313932302c31303830' % base_url
         self.DOWNLOAD_LOCATION = dl_location
         self.FILE_MIN_SIZE = 1024
+        self.OCR_API = 'https://api.ocr.space/parse/image'
+        self.OCR_API_KEY = 'K84899860488957'
 
         self.logger = logger
         self.unpacker = unpacker
         self.plugin_settings = settings
         self.session = requests.Session()
-        self.vertoken = ''
-
-        # 一次性调用，获取那个vertoken。目测这东西会过期，不过不管那么多了，感觉过两天验证机制又要变
-        # self.init_site()
 
     def set_setting(self, settings):
         # for unittestting purpose
         self.plugin_settings = settings
 
-    def init_site(self):
-        self.session.cookies.set(
-            'srcurl', '68747470733a2f2f7a696d756b752e6f72672f')
-        self.get_page(self.ZIMUKU_BASE)
-
-        self.get_page(self.INIT_PAGE)
-        _, resp = self.get_page(self.ZIMUKU_BASE)
-        self.get_vertoken(resp)
-
-    def get_page(self, url, **kwargs):
+    def get_page(self, url, retry=True, **kwargs):
         """
         Get page with requests session.
 
@@ -71,9 +57,11 @@ class Zimuku_Agent:
         Return:
             headers     The http response headers.
             http_body   The http response body.
+            status_code The http status code
         """
         headers = None
         http_body = None
+        status_code = None
         s = self.session
         try:
             request_headers = {'User-Agent': self.ua}
@@ -81,8 +69,9 @@ class Zimuku_Agent:
                 for key, value in list(kwargs.items()):
                     request_headers[key.replace('_', '-')] = value
 
-            a = requests.adapters.HTTPAdapter(max_retries=3)
-            s.mount('http://', a)
+            if retry:
+                a = requests.adapters.HTTPAdapter(max_retries=3)
+                s.mount('http://', a)
 
             # url += '&' if '?' in url else '?'
             # url += 'security_verify_data=313932302c31303830'
@@ -99,11 +88,12 @@ class Zimuku_Agent:
 
             headers = http_response.headers
             http_body = http_response.content
+            status_code = http_response.status_code
         except Exception as e:
             self.logger.log(sys._getframe().f_code.co_name,
                             "ERROR READING %s: %s" % (url, e), level=3)
 
-        return headers, http_body
+        return headers, http_body, status_code
 
     def extract_sub_info(self, sub, lang_info_mode):
         """
@@ -195,21 +185,60 @@ class Zimuku_Agent:
             "lang": langs
         }
 
-    def get_vertoken(self, resp):
-        # get vertoken from home page and cache it for the session
-        self.logger.log(sys._getframe().f_code.co_name,
-                        "Fetching new vertoken form home page")
+    def stringToHex(self, string):
+        length = len(string)
+        hex_string = str()
+        for i in range(length):
+            hex_string += hex(ord(string[i]))[2:]
+        return hex_string
+
+    def get_ocr(self, soup):
         try:
-            headers, data = self.get_page(self.ZIMUKU_BASE+'/')
-            hsoup = BeautifulSoup(resp, 'html.parser')
-            vertoken = hsoup.find(
-                'input', attrs={'name': 'vertoken'}).attrs.get('value', '')
-            self.vertoken = vertoken
-            return vertoken
+            payload = {"base64Image": soup.img['src'], "OCREngine": 1}
+            headers = {'apikey': self.OCR_API_KEY, 'User-Agent': self.ua}
+            ocr_data = requests.post(self.OCR_API, headers=headers, data=payload)
+            text = ocr_data.json()['ParsedResults'][0]['ParsedText'][:5]
+            return text
+        except Exception:
+            return '00000' # return an error captcha to trigger retry
+
+    def verify_captcha(self, data, url, retry):
+        if retry < 0:
+            self.logger.log(sys._getframe().f_code.co_name, 'ERROR VERIFYING CAPTCHA after all retries', level=3)
+            return False
+        soup = BeautifulSoup(data, 'html.parser')
+        hex = self.stringToHex(self.get_ocr(soup))
+        new_url = url + '&security_verify_img=' + hex
+        _, data, code = self.get_page(new_url, retry=False) # init cookie
+        if code == 200:
+            return True
+        elif code == 404:
+            return self.verify_captcha(data, url, retry - 1)
+        else:
+            return False
+
+    def get_query_page(self, url):
+        try:
+            # Search page.
+            _, data, status_code = self.get_page(url, retry=False)
+            if status_code == 200:
+                return data
+            elif status_code == 404:
+                verify_result = self.verify_captcha(data, url, 5)
+                if not verify_result:
+                    return None
+                # get the page twice
+                _, _, _ = self.get_page(url)
+                _, data, status_code = self.get_page(url)
+                return data
+            else:
+                return None
+
         except Exception as e:
-            self.logger.log(sys._getframe().f_code.co_name, 'ERROR GETTING vertoken, E=(%s: %s)' %
+            self.logger.log(sys._getframe().f_code.co_name, 'ERROR SEARCHING, E=(%s: %s)' %
                             (Exception, e), level=3)
-            return ''
+            return None
+
 
     def search(self, title, items):
         """
@@ -231,20 +260,14 @@ class Zimuku_Agent:
         """
         subtitle_list = []
 
-        # vertoken = self.get_vertoken()
-
-        get_cookie_url = '%s&%s' % (self.ZIMUKU_API %
-                                    (urllib.parse.quote(title)), self.TOKEN_PARAM)
-        url = self.ZIMUKU_API % urllib.parse.quote(title)
+        url = self.ZIMUKU_API % (urllib.parse.quote(title))
+        self.logger.log(sys._getframe().f_code.co_name,
+                        "Search API url: %s" % (url))
         try:
-            # 10/10/22: 变成搜索要先拿 cookie
-            self.get_page(url)
-            self.get_page(get_cookie_url)
-
-            # 真正的搜索
-            self.logger.log(sys._getframe().f_code.co_name,
-                            "Search API url: %s" % (url))
-            _, data = self.get_page(url)
+            # Search page which requires captcha check.
+            data = self.get_query_page(url)
+            if data is None:
+                return []
             soup = BeautifulSoup(data, 'html.parser')
         except Exception as e:
             self.logger.log(sys._getframe().f_code.co_name, 'ERROR SEARCHING, E=(%s: %s)' %
@@ -282,7 +305,7 @@ class Zimuku_Agent:
             for page in pages:
                 url = urllib.parse.urljoin(self.ZIMUKU_BASE, page.get('href'))
                 try:
-                    headers, data = self.get_page(url)
+                    headers, data, _ = self.get_page(url)
                     soup = BeautifulSoup(data, 'html.parser')
                     season_list.extend(soup.find_all(
                         "div", class_='item prel clearfix'))
@@ -296,7 +319,7 @@ class Zimuku_Agent:
                 url = urllib.parse.urljoin(self.ZIMUKU_BASE, s.find(
                     "div", class_="title").a.get('href'))
                 try:
-                    headers, data = self.get_page(url)
+                    headers, data, _ = self.get_page(url)
                     soup = BeautifulSoup(
                         data, 'html.parser').find(
                         "div", class_="subs box clearfix")
@@ -319,7 +342,7 @@ class Zimuku_Agent:
             for s in reversed(season_list)]
         for url in urls:
             try:
-                headers, data = self.get_page(url)
+                headers, data, _ = self.get_page(url)
                 soup = BeautifulSoup(
                     data, 'html.parser').find(
                     "div", class_="subs box clearfix")
@@ -452,7 +475,7 @@ class Zimuku_Agent:
                                   ".gz", ".xz", ".iso", ".tgz", ".tbz2", ".cbr")
         try:
             # Subtitle detail page.
-            headers, data = self.get_page(url)
+            headers, data, _ = self.get_page(url)
             soup = BeautifulSoup(data, 'html.parser')
             url = soup.find("li", class_="dlsub").a.get('href')
 
@@ -462,7 +485,7 @@ class Zimuku_Agent:
                             "GET SUB DETAIL PAGE: %s" % (url))
 
             # Subtitle download-list page.
-            headers, data = self.get_page(url)
+            headers, data, _ = self.get_page(url)
             soup = BeautifulSoup(data, 'html.parser')
             links = soup.find("div", {"class": "clearfix"}).find_all('a')
         except:
