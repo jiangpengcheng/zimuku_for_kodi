@@ -44,21 +44,16 @@ class Zimuku_Agent:
         self.session = requests.Session()
         self.vertoken = ''
 
-        # 一次性调用，获取那个vertoken。目测这东西会过期，不过不管那么多了，感觉过两天验证机制又要变
-        # self.init_site()
+        # 一次性调用，获取必需的cookies，验证机制可能之后会变
+        self.init_site()
 
     def set_setting(self, settings):
         # for unittestting purpose
         self.plugin_settings = settings
 
     def init_site(self):
-        self.session.cookies.set(
-            'srcurl', '68747470733a2f2f7a696d756b752e6f72672f')
-        self.get_page(self.ZIMUKU_BASE)
-
         self.get_page(self.INIT_PAGE)
-        _, resp = self.get_page(self.ZIMUKU_BASE)
-        self.get_vertoken(resp)
+        self.get_page(self.INIT_PAGE)
 
     def get_page(self, url, **kwargs):
         """
@@ -237,10 +232,6 @@ class Zimuku_Agent:
                                     (urllib.parse.quote(title)), self.TOKEN_PARAM)
         url = self.ZIMUKU_API % urllib.parse.quote(title)
         try:
-            # 10/10/22: 变成搜索要先拿 cookie
-            self.get_page(url)
-            self.get_page(get_cookie_url)
-
             # 真正的搜索
             self.logger.log(sys._getframe().f_code.co_name,
                             "Search API url: %s" % (url))
@@ -305,12 +296,19 @@ class Zimuku_Agent:
                                     'Error getting sub page', level=3)
                     return []
                 subs = soup.tbody.find_all("tr")
+                unfiltered_sub_list = []
                 for sub in reversed(subs):
+                    subtitle = self.extract_sub_info(sub, 2)
+                    unfiltered_sub_list.append(subtitle)
                     sub_name = sub.a.text
                     if s_e in sub_name.upper():
-                        subtitle_list.append(self.extract_sub_info(sub, 2))
+                        subtitle_list.append(subtitle)
                 # 如果匹配到了季，那就得返回了，没有就是没有
-                return self.double_filter(subtitle_list, items)
+                # 如果没有匹配到，可能整季度的字幕被打包到一个文件中了，那就把所有的结果都返回让用户自己选择
+                if len(subtitle_list) > 0:
+                    return self.double_filter(subtitle_list, items)
+                else:
+                    return unfiltered_sub_list
 
         # 精确查找没找到，那就返回所有
         subtitle_list = []
@@ -438,7 +436,7 @@ class Zimuku_Agent:
         下载并返回字幕文件列表
 
         Params:
-            url    字幕详情页面，如 http://zimuku.org/detail/155262.html
+            url    字幕详情页面，如 https://srtku.com/detail/155262.html
 
         Return:
             [], [], []  返回 3 个列表
